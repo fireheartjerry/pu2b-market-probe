@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>PU2B KALSHI DIAG</title></head>
+<body>
+<pre id="log">boot</pre>
+<script>
+const L=[]; const $l=document.getElementById('log');
+function log(m){ L.push(m); $l.textContent=L.join('\n'); }
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const TARGET='https://api.elections.kalshi.com/trade-api/v2/markets?limit=1&status=open';
+async function probe(name, url){
+  try{
+    const ac=new AbortController(); const to=setTimeout(()=>ac.abort(),20000);
+    const r=await fetch(url,{signal:ac.signal}); clearTimeout(to);
+    const t=await r.text();
+    log(name+' => HTTP '+r.status+' bytes='+t.length+' head='+t.slice(0,60).replace(/\n/g,' '));
+    return r.status===200;
+  }catch(e){ log(name+' => ERR '+e.message); return false; }
+}
+(async()=>{
+  await probe('direct', TARGET);
+  await probe('allorigins', 'https://api.allorigins.win/raw?url='+encodeURIComponent(TARGET));
+  await sleep(500);
+  await probe('cors.lol', 'https://api.cors.lol/?url='+encodeURIComponent(TARGET));
+  await sleep(500);
+  await probe('cors.eu.org', 'https://cors.eu.org/'+TARGET);
+  await sleep(500);
+  await probe('codetabs', 'https://api.codetabs.com/v1/proxy?quest='+encodeURIComponent(TARGET));
+  await sleep(500);
+  await probe('corsproxy.io', 'https://corsproxy.io/?url='+encodeURIComponent(TARGET));
+  await sleep(500);
+  await probe('corsproxy.com', 'https://www.corsproxy.com/?url='+encodeURIComponent(TARGET));
+  log('DIAG_DONE');
+})();
+</script>
+</body></html>
