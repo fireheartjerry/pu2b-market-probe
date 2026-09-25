@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>PU2B BOOT</title></head>
+<body>
+<pre id="log">boot</pre>
+<script>
+const $log = document.getElementById('log');
+const L = [];
+const ERRS = [];
+function log(m){ const line = new Date().toISOString()+' '+m; L.push(line); $log.textContent = L.slice(-40).join('\n'); document.title = ('PU2B '+m).slice(0,60); }
+window.onerror = (m)=>{ ERRS.push('window.onerror: '+m); log('ONERROR '+m); };
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+
+async function fetchText(url, tries){
+  let lastErr = null;
+  for(let i=0;i<(tries||4);i++){
+    try{
+      const ac = new AbortController(); const to = setTimeout(()=>ac.abort(), 60000);
+      const r = await fetch(url, {signal: ac.signal});
+      clearTimeout(to);
+      if(r.status===429 || r.status>=500){ log('HTTP '+r.status+' retry'+i); await sleep(1500*(i+1)); continue; }
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      return await r.text();
+    }catch(e){ lastErr=e; log('FETCHERR '+e.message+' retry'+i); await sleep(1200*(i+1)); }
+  }
+  throw (lastErr||new Error('fetch failed'));
+}
+
+async function sha256hex(s){
+  const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('');
+}
+
+async function gammaFetchAll(state){
+  const base='https://gamma-api.polymarket.com/events';
+  const lim=100, volMin=50000, maxPages=400;
+  let offset=0;
+  while(true){
+    const url = base+'?limit='+lim+'&offset='+offset+'&active=true&closed=false&order=volume&ascending=false';
+    const txt = await fetchText(url);
+    let arr;
+    try{ arr = JSON.parse(txt); }catch(e){ ERRS.push('gamma parse fail @'+offset); log('gamma parse fail @'+offset); await sleep(2000); continue; }
+    const rec = {offset, bytes: txt.length, n: arr.length, sha256: await sha256hex(txt)};
+    state.gamma.pages.push(txt); state.gamma.pageMeta.push(rec);
+    if(arr.length===0){ log('gamma empty page @'+offset); break; }
+    let maxV=0, minV=Infinity;
+    for(const e of arr){ const v = parseFloat(e.volume||0)||0; if(v>maxV)maxV=v; if(v<minV)minV=v; if(v>=volMin) state.gamma.kept++; }
+    log('gamma @'+offset+' n='+arr.length+' maxV='+Math.round(maxV)+' minV='+Math.round(minV));
+    if(maxV < volMin){ log('gamma stop: page maxVol below 50k'); break; }
+    offset += lim;
+    if(offset >= maxPages*lim){ state.gamma.capped = true; log('gamma stop: page cap'); break; }
+    await sleep(450);
+  }
+}
+
+async function kalshiFetchAll(state){
+  const base='https://api.elections.kalshi.com/trade-api/v2/markets';
+  let cursor=null, page=0;
+  while(true){
+    let url = base+'?limit=1000&status=open';
+    if(cursor) url += '&cursor='+encodeURIComponent(cursor);
+    let txt;
+    try{ txt = await fetchText(url); }
+    catch(e){
+      log('kalshi direct fail -> allorigins proxy');
+      state.kalshi.viaProxy = true;
+      txt = await fetchText('https://api.allorigins.win/raw?url='+encodeURIComponent(url));
+    }
+    let obj;
+    try{ obj = JSON.parse(txt); }catch(e){ ERRS.push('kalshi parse fail p'+page); log('kalshi parse fail p'+page); break; }
+    const mkts = obj.markets || [];
+    const rec = {page, bytes: txt.length, n: mkts.length, sha256: await sha256hex(txt)};
+    state.kalshi.pages.push(txt); state.kalshi.pageMeta.push(rec);
+    state.kalshi.total += mkts.length;
+    log('kalshi p'+page+' n='+mkts.length);
+    cursor = obj.cursor;
+    page++;
+    if(!cursor || mkts.length===0) break;
+    if(page>=60){ state.kalshi.capped = true; log('kalshi stop: page cap'); break; }
+    await sleep(400);
+  }
+}
+
+async function btcPrice(state){
+  try{
+    const txt = await fetchText('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd', 2);
+    state.btc = JSON.parse(txt);
+    log('btc '+txt.slice(0,60));
+  }catch(e){ state.btc = {error: e.message}; log('btc fetch failed'); }
+}
+
+async function gzipBlob(s){
+  if(!('CompressionStream' in window)) return null;
+  const cs = new CompressionStream('gzip');
+  const w = cs.writable.getWriter();
+  w.write(new TextEncoder().encode(s)); w.close();
+  const buf = await new Response(cs.readable).arrayBuffer();
+  return new Blob([buf], {type:'application/gzip'});
+}
+
+let finalized = false;
+async function finalize(state, partial){
+  if(finalized) return; finalized = true;
+  state.partial = !!partial;
+  state.finished_utc = new Date().toISOString();
+  state.errors = ERRS;
+  state.logTail = L.slice(-60);
+  const bundle = {format:'pu2b-bundle-v1', manifest: state,
+    gamma_pages: state.gamma.pages, kalshi_pages: state.kalshi.pages};
+  delete bundle.manifest.gamma.pages; delete bundle.manifest.kalshi.pages;
+  const raw = JSON.stringify(bundle);
+  log('bundle json bytes='+raw.length);
+  let blob = await gzipBlob(raw);
+  let name = 'pu2b_bundle.json.gz';
+  if(!blob){ blob = new Blob([raw], {type:'application/json'}); name='pu2b_bundle.json'; }
+  state.bundle_bytes = blob.size;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click();
+  log('BUNDLE_DONE '+name+' bytes='+blob.size);
+  document.title = 'PU2B BUNDLE_DONE';
+}
+
+(async ()=>{
+  const state = {
+    started_utc: new Date().toISOString(),
+    gamma: {pages:[], pageMeta:[], kept:0, capped:false},
+    kalshi: {pages:[], pageMeta:[], total:0, capped:false, viaProxy:false},
+    btc: null
+  };
+  setTimeout(()=>{ if(!finalized){ log('WATCHDOG finalize partial'); finalize(state, true); } }, 8*60*1000);
+  try{
+    await gammaFetchAll(state);
+  }catch(e){ ERRS.push('gamma fatal: '+e.message); log('gamma FATAL '+e.message); }
+  try{
+    await kalshiFetchAll(state);
+  }catch(e){ ERRS.push('kalshi fatal: '+e.message); log('kalshi FATAL '+e.message); }
+  await btcPrice(state);
+  await finalize(state, false);
+})();
+</script>
+</body></html>
