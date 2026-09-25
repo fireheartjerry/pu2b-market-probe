@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>PU2B KALSHI FETCH</title></head>
+<body>
+<pre id="log">boot</pre>
+<script>
+const L=[]; const ERRS=[]; const $l=document.getElementById('log');
+function log(m){ const line=new Date().toISOString()+' '+m; L.push(line); $l.textContent=L.slice(-30).join('\n'); document.title=('PU2BK '+m).slice(0,60); }
+window.onerror=(m)=>{ ERRS.push('onerror: '+m); log('ONERROR '+m); };
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+function withTimeout(promise, ms){
+  return Promise.race([promise, new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout'+ms)), ms))]);
+}
+async function tryFetch(url, ms){
+  const r = await withTimeout(fetch(url), ms||25000);
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  return await r.text();
+}
+async function raceFetch(url){
+  const enc = encodeURIComponent(url);
+  const attempts = [
+    ['direct', ()=>tryFetch(url, 12000)],
+    ['cors.lol', ()=>tryFetch('https://api.cors.lol/?url='+enc, 20000)],
+    ['codetabs', ()=>tryFetch('https://api.codetabs.com/v1/proxy?quest='+enc, 25000)],
+    ['cors.eu.org', ()=>tryFetch('https://cors.eu.org/'+url, 20000)],
+    ['allorigins', ()=>tryFetch('https://api.allorigins.win/raw?url='+enc, 30000)],
+  ];
+  const errors = [];
+  return await new Promise((resolve, reject)=>{
+    let pending = attempts.length;
+    for(const [name, fn] of attempts){
+      fn().then(txt=>{
+        log('OK via '+name+' bytes='+txt.length);
+        resolve({via:name, txt});
+        pending = -1; // latch
+      }).catch(e=>{
+        errors.push(name+':'+e.message);
+        if(--pending===0) reject(new Error('all failed: '+errors.join(' | ')));
+      });
+    }
+  });
+}
+async function sha256hex(s){
+  const b=await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('');
+}
+async function gzipBlob(s){
+  if(!('CompressionStream' in window)) return null;
+  const cs=new CompressionStream('gzip');
+  const w=cs.writable.getWriter(); w.write(new TextEncoder().encode(s)); w.close();
+  const buf=await new Response(cs.readable).arrayBuffer();
+  return new Blob([buf],{type:'application/gzip'});
+}
+let finalized=false;
+function finalize(state, partial){
+  if(finalized) return; finalized=true;
+  state.partial=!!partial; state.finished_utc=new Date().toISOString();
+  state.errors=ERRS; state.logTail=L.slice(-60);
+  const bundle={format:'pu2b-kalshi-bundle-v1', manifest:state, kalshi_pages:state.pages};
+  const raw=JSON.stringify(bundle);
+  gzipBlob(raw).then(blob=>{
+    let name='pu2b_kalshi_bundle.json.gz';
+    if(!blob){ blob=new Blob([raw],{type:'application/json'}); name='pu2b_kalshi_bundle.json'; }
+    const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name;
+    document.body.appendChild(a); a.click();
+    log('BUNDLE_DONE '+name+' bytes='+blob.size);
+    document.title='PU2BK BUNDLE_DONE';
+  });
+}
+(async()=>{
+  const state={started_utc:new Date().toISOString(), pages:[], pageMeta:[], total:0, capped:false, viaCounts:{}};
+  setTimeout(()=>{ if(!finalized){ log('WATCHDOG partial finalize'); finalize(state,true); } }, 7*60*1000);
+  const base='https://api.elections.kalshi.com/trade-api/v2/markets';
+  let cursor=null, page=0;
+  try{
+    while(true){
+      let url=base+'?limit=1000&status=open';
+      if(cursor) url+='&cursor='+encodeURIComponent(cursor);
+      let res;
+      try{ res=await raceFetch(url); }
+      catch(e){ ERRS.push('kalshi page '+page+' fatal: '+e.message); log('FATAL p'+page+' '+e.message.slice(0,120)); break; }
+      state.viaCounts[res.via]=(state.viaCounts[res.via]||0)+1;
+      let obj;
+      try{ obj=JSON.parse(res.txt); }catch(e){ ERRS.push('parse fail p'+page); log('parse fail p'+page); break; }
+      const mkts=obj.markets||[];
+      state.pages.push(res.txt);
+      state.pageMeta.push({page, bytes:res.txt.length, n:mkts.length, sha256:await sha256hex(res.txt), via:res.via});
+      state.total+=mkts.length;
+      log('kalshi p'+page+' n='+mkts.length+' via='+res.via);
+      cursor=obj.cursor; page++;
+      if(!cursor || mkts.length===0) break;
+      if(page>=50){ state.capped=true; log('page cap'); break; }
+      await sleep(500);
+    }
+  } finally {
+    finalize(state, false);
+  }
+})();
+</script>
+</body></html>
