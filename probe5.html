@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>PU2B K5 BOOT</title></head>
+<body>
+<pre id="log">boot</pre>
+<script>
+const L=[]; const ERRS=[]; const $l=document.getElementById('log');
+function log(m){ const line=Date.now()+' '+m; L.push(line); $l.textContent=L.slice(-30).join('\n'); document.title=('PU2BK5 '+m).slice(0,60); }
+window.onerror=(m)=>{ ERRS.push('onerror: '+m); };
+log('script started');
+
+function dl(name, text){
+  try{
+    const blob=new Blob([text],{type:'application/json'});
+    const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name;
+    document.body.appendChild(a); a.click();
+    log('DOWNLOADED '+name+' bytes='+blob.size);
+  }catch(e){ log('DLERR '+e.message); }
+}
+
+async function raceFetch(url){
+  const enc=encodeURIComponent(url);
+  const attempts=[
+    ['direct', url],
+    ['cors.lol', 'https://api.cors.lol/?url='+enc],
+    ['codetabs', 'https://api.codetabs.com/v1/proxy?quest='+enc],
+    ['cors.eu.org', 'https://cors.eu.org/'+url],
+  ];
+  const errs=[];
+  return await new Promise((resolve,reject)=>{
+    let pending=attempts.length;
+    for(const [name,u] of attempts){
+      fetch(u).then(async r=>{
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        const txt=await r.text();
+        resolve({via:name, txt});
+      }).catch(e=>{
+        errs.push(name+':'+e.message);
+        if(--pending===0) reject(new Error(errs.join(' | ')));
+      });
+    }
+  });
+}
+
+(async()=>{
+  const base='https://api.elections.kalshi.com/trade-api/v2/markets';
+  let cursor=null, page=0;
+  const chunk=[]; const meta={started_utc:new Date().toISOString(), chunks:[], total:0};
+  const CHUNK=8;
+  let chunkIdx=0, chunkPages=[];
+  while(true){
+    let url=base+'?limit=1000&status=open';
+    if(cursor) url+='&cursor='+encodeURIComponent(cursor);
+    let res;
+    try{ res=await raceFetch(url); }
+    catch(e){ ERRS.push('fatal p'+page+': '+e.message); log('FATAL p'+page+' '+e.message.slice(0,150)); break; }
+    let obj;
+    try{ obj=JSON.parse(res.txt); }catch(e){ ERRS.push('parse fail p'+page+' via '+res.via); log('parse fail p'+page+' via '+res.via+' head='+res.txt.slice(0,60)); break; }
+    const mkts=obj.markets||[];
+    chunkPages.push({page, bytes:res.txt.length, n:mkts.length, via:res.via});
+    chunk.push(res.txt);
+    meta.total+=mkts.length;
+    log('p'+page+' n='+mkts.length+' via='+res.via);
+    cursor=obj.cursor; page++;
+    if(chunk.length>=CHUNK || !cursor || mkts.length===0){
+      const payload=JSON.stringify({format:'pu2b-kalshi-chunk-v1', chunk:chunkIdx, pages:chunkPages, data:chunk});
+      dl('pu2b_kalshi_chunk_'+String(chunkIdx).padStart(3,'0')+'.json', payload);
+      meta.chunks.push({chunk:chunkIdx, pages:chunkPages});
+      chunk.length=0; chunkPages=[]; chunkIdx++;
+      if(!cursor || mkts.length===0) break;
+    }
+    if(page>=48){ meta.capped=true; log('page cap'); break; }
+  }
+  meta.finished_utc=new Date().toISOString(); meta.errors=ERRS; meta.logTail=L.slice(-40);
+  dl('pu2b_kalshi_manifest.json', JSON.stringify(meta,null,1));
+  log('ALL_DONE total='+meta.total);
+  document.title='PU2BK5 ALL_DONE';
+})();
+</script>
+</body></html>
